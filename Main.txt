@@ -1,0 +1,1001 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'servicio_alerta.dart';
+
+const Color kGuinda = Color(0xFF800020);
+const Color kVerde = Color(0xFF1E7A4F);
+const Color kRojo = Color(0xFFB3261E);
+
+// Instancia global para las notificaciones locales
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+    FlutterLocalNotificationsPlugin();
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  await flutterLocalNotificationsPlugin.initialize(
+    const InitializationSettings(
+      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+    ),
+  );
+
+  await inicializarServicioSegundoPlano(flutterLocalNotificationsPlugin);
+
+  runApp(const AlertaBleApp());
+}
+
+class AlertaBleApp extends StatelessWidget {
+  const AlertaBleApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Alerta SOS BLE',
+      theme: ThemeData(
+        primaryColor: kGuinda,
+        colorScheme: ColorScheme.fromSeed(seedColor: kGuinda, primary: kGuinda),
+        scaffoldBackgroundColor: Colors.grey[50],
+      ),
+      home: const PermisosGate(),
+    );
+  }
+}
+
+// =================================================================
+// 0. PERMISOS (se muestran al iniciar la app)
+// =================================================================
+class PermisoInfo {
+  final String titulo;
+  final String descripcion;
+  final List<Permission> permisos; // Se piden en orden, uno por uno
+  const PermisoInfo(this.titulo, this.descripcion, this.permisos);
+}
+
+final List<PermisoInfo> permisosRequeridos = [
+  PermisoInfo('Bluetooth', 'Para conectarnos con tu banda.',
+      [Permission.bluetoothScan, Permission.bluetoothConnect]),
+  PermisoInfo(
+      'Ubicación',
+      'Para decirle a tu contacto dónde estás. Elige "Permitir todo el tiempo" para que funcione con la app cerrada.',
+      [Permission.locationWhenInUse, Permission.locationAlways]),
+  PermisoInfo('Mensajes SMS', 'Para enviar el aviso automáticamente.',
+      [Permission.sms]),
+  PermisoInfo('Notificaciones',
+      'Para mostrar que la banda está activa en segundo plano.',
+      [Permission.notification]),
+  PermisoInfo('Batería',
+      'Para que el celular no apague la protección. Elige "Sin restricciones".',
+      [Permission.ignoreBatteryOptimizations]),
+];
+
+PermissionStatus _combinarEstados(List<PermissionStatus> estados) {
+  if (estados.every((s) => s.isGranted)) return PermissionStatus.granted;
+  if (estados.any((s) => s.isPermanentlyDenied)) {
+    return PermissionStatus.permanentlyDenied;
+  }
+  return PermissionStatus.denied;
+}
+
+Future<PermissionStatus> estadoDePermiso(PermisoInfo info) async {
+  final estados = <PermissionStatus>[];
+  for (final p in info.permisos) {
+    estados.add(await p.status);
+  }
+  return _combinarEstados(estados);
+}
+
+// Se piden uno por uno: Android 11+ exige pedir "siempre" DESPUÉS de "mientras se usa"
+Future<PermissionStatus> solicitarPermiso(PermisoInfo info) async {
+  final estados = <PermissionStatus>[];
+  for (final p in info.permisos) {
+    final estado = await p.request();
+    estados.add(estado);
+    if (!estado.isGranted) break;
+  }
+  return _combinarEstados(estados);
+}
+
+Future<bool> todosLosPermisosConcedidos() async {
+  for (final info in permisosRequeridos) {
+    if (!(await estadoDePermiso(info)).isGranted) return false;
+  }
+  return true;
+}
+
+/// Decide si mostrar la pantalla de permisos o pasar directo al inicio.
+class PermisosGate extends StatefulWidget {
+  const PermisosGate({super.key});
+
+  @override
+  State<PermisosGate> createState() => _PermisosGateState();
+}
+
+class _PermisosGateState extends State<PermisosGate> {
+  bool _cargando = true;
+  bool _todoListo = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _revisar();
+  }
+
+  Future<void> _revisar() async {
+    final ok = await todosLosPermisosConcedidos();
+    if (!mounted) return;
+    setState(() {
+      _todoListo = ok;
+      _cargando = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_cargando) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (_todoListo) return const RoleSelectionScreen();
+    return PermisosScreen(onContinuar: () => setState(() => _todoListo = true));
+  }
+}
+
+class PermisosScreen extends StatefulWidget {
+  final VoidCallback onContinuar;
+  const PermisosScreen({super.key, required this.onContinuar});
+
+  @override
+  State<PermisosScreen> createState() => _PermisosScreenState();
+}
+
+class _PermisosScreenState extends State<PermisosScreen>
+    with WidgetsBindingObserver {
+  final Map<String, PermissionStatus> _estados = {};
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _refrescar();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  // Al volver de los Ajustes del sistema, se vuelve a revisar todo
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _refrescar();
+  }
+
+  Future<void> _refrescar() async {
+    for (final info in permisosRequeridos) {
+      _estados[info.titulo] = await estadoDePermiso(info);
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _activar(PermisoInfo info) async {
+    if (_estados[info.titulo] == PermissionStatus.permanentlyDenied) {
+      await openAppSettings();
+      return;
+    }
+    _estados[info.titulo] = await solicitarPermiso(info);
+    if (mounted) setState(() {});
+  }
+
+  int get _faltantes => permisosRequeridos
+      .where((i) => _estados[i.titulo]?.isGranted != true)
+      .length;
+
+  @override
+  Widget build(BuildContext context) {
+    final faltan = _faltantes;
+    final todoListo = faltan == 0 && _estados.isNotEmpty;
+    final textoFaltan = faltan == 1
+        ? 'Falta 1 permiso. Sin él, la banda no protegerá bien.'
+        : 'Faltan $faltan permisos. Sin ellos, la banda no protegerá bien.';
+
+    return Scaffold(
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 24, 20, 20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Antes de empezar',
+                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Text(
+                'Necesitamos ${permisosRequeridos.length} permisos para que la banda funcione.',
+                style: const TextStyle(
+                    fontSize: 17, color: Colors.black54, height: 1.4),
+              ),
+              const SizedBox(height: 20),
+              Expanded(
+                child: ListView.separated(
+                  itemCount: permisosRequeridos.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 14),
+                  itemBuilder: (context, i) =>
+                      _tarjetaPermiso(permisosRequeridos[i]),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: todoListo
+                      ? const Color(0xFFDDF0E5)
+                      : const Color(0xFFFBEAD7),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Text(
+                  todoListo ? 'Todo listo. Ya puedes continuar.' : textoFaltan,
+                  style: const TextStyle(fontSize: 16, height: 1.35),
+                ),
+              ),
+              const SizedBox(height: 14),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: kGuinda,
+                  disabledBackgroundColor: Colors.grey[300],
+                  minimumSize: const Size.fromHeight(56),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14)),
+                ),
+                onPressed: todoListo ? widget.onContinuar : null,
+                child: Text('Continuar',
+                    style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: todoListo ? Colors.white : Colors.grey[600])),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _tarjetaPermiso(PermisoInfo info) {
+    final estado = _estados[info.titulo];
+    final concedido = estado?.isGranted == true;
+    final bloqueado = estado == PermissionStatus.permanentlyDenied;
+
+    return Card(
+      elevation: 0,
+      color: Colors.white,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: BorderSide(color: Colors.grey.shade300),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(info.titulo,
+                      style: const TextStyle(
+                          fontSize: 19, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  Text(info.descripcion,
+                      style: const TextStyle(
+                          fontSize: 16, color: Colors.black54, height: 1.35)),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            if (concedido)
+              const Text('Activado',
+                  style: TextStyle(
+                      fontSize: 16, fontWeight: FontWeight.bold, color: kVerde))
+            else
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: kGuinda,
+                  minimumSize: const Size(0, 44),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+                onPressed: () => _activar(info),
+                child: Text(bloqueado ? 'Ajustes' : 'Activar',
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold)),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// =================================================================
+// 1. SELECCIÓN DE MODO
+// =================================================================
+class RoleSelectionScreen extends StatelessWidget {
+  const RoleSelectionScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Selección de Modo - Alerta SOS',
+            style: TextStyle(color: Colors.white)),
+        backgroundColor: kGuinda,
+        centerTitle: true,
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.security_rounded, size: 80, color: kGuinda),
+            const SizedBox(height: 20),
+            const Text('Selecciona tu Modo de Usuario',
+                style: TextStyle(
+                    fontSize: 22,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.black87)),
+            const SizedBox(height: 10),
+            const Text(
+              'Elige cómo operará este dispositivo en la red de emergencia.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.grey),
+            ),
+            const SizedBox(height: 40),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: kGuinda,
+                minimumSize: const Size.fromHeight(60),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () => Navigator.pushReplacement(context,
+                  MaterialPageRoute(builder: (_) => const EmisorScreen())),
+              icon: const Icon(Icons.sensors, color: Colors.white, size: 28),
+              label: const Text('MODO EMISOR (Dispositivo / Pulsera)',
+                  style: TextStyle(color: Colors.white, fontSize: 16)),
+            ),
+            const SizedBox(height: 20),
+            OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: kGuinda, width: 2),
+                minimumSize: const Size.fromHeight(60),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () => Navigator.pushReplacement(context,
+                  MaterialPageRoute(builder: (_) => const ReceptorScreen())),
+              icon: const Icon(Icons.phone_android, color: kGuinda, size: 28),
+              label: const Text('MODO RECEPTOR (Contacto de Apoyo)',
+                  style: TextStyle(color: kGuinda, fontSize: 16)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// =================================================================
+// 2. MODO EMISOR
+//    La pantalla SOLO configura y muestra el estado.
+//    El BLE, la ubicación y los SMS viven en el servicio (servicio_alerta.dart).
+// =================================================================
+class EmisorScreen extends StatefulWidget {
+  const EmisorScreen({super.key});
+
+  @override
+  State<EmisorScreen> createState() => _EmisorScreenState();
+}
+
+class _EmisorScreenState extends State<EmisorScreen> {
+  final FlutterBackgroundService _servicio = FlutterBackgroundService();
+  final TextEditingController _phoneController = TextEditingController();
+  final List<StreamSubscription> _subs = [];
+
+  List<String> _receptores = [];
+  bool _servicioActivo = false;
+  bool _conectado = false;
+  bool _escaneando = false;
+  String _mensajeEstado = 'Iniciando...';
+  String _nombreBanda = '';
+  String _ultimaAlerta = '';
+  List<Map<String, String>> _dispositivos = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _iniciar();
+  }
+
+  @override
+  void dispose() {
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _phoneController.dispose();
+    super.dispose();
+  }
+
+  Future<SharedPreferences> _prefs() async {
+    final p = await SharedPreferences.getInstance();
+    await p.reload();
+    return p;
+  }
+
+  Future<void> _iniciar() async {
+    final prefs = await _prefs();
+    if (!mounted) return;
+    setState(() {
+      _receptores = prefs.getStringList(kPrefReceptores) ?? [];
+      _nombreBanda = prefs.getString(kPrefBandaNombre) ?? '';
+      _ultimaAlerta = prefs.getString(kPrefUltimaAlerta) ?? '';
+    });
+
+    // Primero se escucha, luego se arranca el servicio
+    _subs.add(_servicio.on('estado').listen((e) async {
+      final p = await _prefs();
+      if (!mounted) return;
+      setState(() {
+        _conectado = e?['conectado'] == true;
+        _mensajeEstado = (e?['mensaje'] as String?) ?? '';
+        _nombreBanda = p.getString(kPrefBandaNombre) ?? '';
+      });
+    }));
+
+    _subs.add(_servicio.on('resultadosEscaneo').listen((e) {
+      if (!mounted) return;
+      final lista = ((e?['dispositivos'] as List?) ?? [])
+          .map((x) => {
+                'id': (x['id'] ?? '').toString(),
+                'nombre': (x['nombre'] ?? '').toString(),
+              })
+          .toList();
+      // Los que parecen ESP32 salen primero
+      lista.sort((a, b) {
+        final aEsp = a['nombre']!.toLowerCase().contains('esp') ? 0 : 1;
+        final bEsp = b['nombre']!.toLowerCase().contains('esp') ? 0 : 1;
+        return aEsp.compareTo(bEsp);
+      });
+      setState(() {
+        _dispositivos = lista;
+        _escaneando = false;
+      });
+    }));
+
+    _subs.add(_servicio.on('alertaEnviada').listen((e) {
+      if (!mounted) return;
+      final texto = (e?['texto'] as String?) ?? '';
+      setState(() => _ultimaAlerta = texto);
+      _aviso(texto, Colors.green);
+    }));
+
+    _subs.add(_servicio.on('error').listen((e) {
+      if (!mounted) return;
+      _aviso((e?['mensaje'] as String?) ?? 'Ocurrió un error.', kRojo);
+    }));
+
+    await _arrancarServicio();
+  }
+
+  Future<void> _arrancarServicio() async {
+    if (!await _servicio.isRunning()) {
+      await _servicio.startService();
+    }
+    if (!mounted) return;
+    setState(() => _servicioActivo = true);
+    await Future.delayed(const Duration(seconds: 1));
+    _servicio.invoke('pedirEstado');
+  }
+
+  void _aviso(String texto, Color color) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(texto), backgroundColor: color),
+    );
+  }
+
+  // ---------------- Contactos (guardados en el celular) ----------------
+  Future<void> _guardarReceptores() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setStringList(kPrefReceptores, _receptores);
+  }
+
+  void _agregarReceptor() {
+    final numero = _phoneController.text.trim();
+    if (numero.isEmpty || _receptores.contains(numero)) return;
+    setState(() {
+      _receptores.add(numero);
+      _phoneController.clear();
+    });
+    _guardarReceptores();
+  }
+
+  void _quitarReceptor(String numero) {
+    setState(() => _receptores.remove(numero));
+    _guardarReceptores();
+  }
+
+  // ---------------- Banda ----------------
+  void _escanear() {
+    setState(() {
+      _escaneando = true;
+      _dispositivos = [];
+    });
+    _servicio.invoke('escanear');
+    // Por si el servicio no responde
+    Future.delayed(const Duration(seconds: 15), () {
+      if (mounted && _escaneando) setState(() => _escaneando = false);
+    });
+  }
+
+  void _vincular(Map<String, String> d) {
+    _servicio.invoke('conectar', {'id': d['id'], 'nombre': d['nombre']});
+    setState(() {
+      _nombreBanda = d['nombre'] ?? '';
+      _dispositivos = [];
+      _mensajeEstado = 'Buscando banda...';
+    });
+  }
+
+  void _desvincular() {
+    _servicio.invoke('desconectar');
+    setState(() {
+      _nombreBanda = '';
+      _conectado = false;
+    });
+  }
+
+  void _alertaPrueba() {
+    if (_receptores.isEmpty) {
+      _aviso('Agrega al menos un contacto primero.', kRojo);
+      return;
+    }
+    _servicio.invoke('alertaPrueba');
+  }
+
+  void _detenerProteccion() {
+    _servicio.invoke('stopService');
+    setState(() {
+      _servicioActivo = false;
+      _conectado = false;
+    });
+  }
+
+  // ---------------- Interfaz ----------------
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Banda Alerta', style: TextStyle(color: Colors.white)),
+        backgroundColor: kGuinda,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          // El servicio sigue activo al salir: es lo que protege en segundo plano
+          onPressed: () => Navigator.pushReplacement(context,
+              MaterialPageRoute(builder: (_) => const RoleSelectionScreen())),
+        ),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          _tarjetaEstado(),
+          const SizedBox(height: 16),
+          Text(
+            _receptores.isEmpty
+                ? 'Agrega un contacto para que la banda pueda avisarle.'
+                : 'Si presionas los 3 botones de la banda, se avisará a ${_receptores.length} contacto(s) con tu ubicación.',
+            style: const TextStyle(fontSize: 17, height: 1.4),
+          ),
+          const SizedBox(height: 16),
+          _tarjetaContactos(),
+          const SizedBox(height: 16),
+          _seccionBanda(),
+          const SizedBox(height: 16),
+          OutlinedButton(
+            style: OutlinedButton.styleFrom(
+              side: const BorderSide(color: kGuinda, width: 2),
+              minimumSize: const Size.fromHeight(56),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14)),
+            ),
+            onPressed: _servicioActivo ? _alertaPrueba : null,
+            child: const Text('Enviar alerta de prueba',
+                style: TextStyle(
+                    color: kGuinda, fontSize: 18, fontWeight: FontWeight.bold)),
+          ),
+          if (_ultimaAlerta.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE3ECF8),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Text('Última: $_ultimaAlerta',
+                  style: const TextStyle(fontSize: 16)),
+            ),
+          ],
+          const SizedBox(height: 24),
+          if (_servicioActivo)
+            TextButton(
+              onPressed: _detenerProteccion,
+              child: const Text('Detener protección',
+                  style: TextStyle(color: kRojo, fontSize: 16)),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _tarjetaEstado() {
+    final Color fondo;
+    final IconData icono;
+    final String titulo;
+    final String detalle;
+
+    if (!_servicioActivo) {
+      fondo = Colors.grey.shade700;
+      icono = Icons.power_settings_new;
+      titulo = 'Protección detenida';
+      detalle = 'Inicia la protección para usar la banda.';
+    } else if (_conectado) {
+      fondo = kVerde;
+      icono = Icons.check_circle;
+      titulo = 'Banda conectada';
+      detalle = 'Todo listo para protegerte';
+    } else {
+      fondo = kRojo;
+      icono = Icons.bluetooth_disabled;
+      titulo = 'Banda desconectada';
+      detalle = _mensajeEstado;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 28, horizontal: 20),
+      decoration: BoxDecoration(
+        color: fondo,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        children: [
+          Icon(icono, size: 44, color: Colors.white),
+          const SizedBox(height: 10),
+          Text(titulo,
+              style: const TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white)),
+          const SizedBox(height: 6),
+          Text(detalle,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 17, color: Colors.white)),
+          if (!_servicioActivo) ...[
+            const SizedBox(height: 16),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.white,
+                minimumSize: const Size(0, 48),
+              ),
+              onPressed: _arrancarServicio,
+              child: const Text('Iniciar protección',
+                  style: TextStyle(
+                      color: kGuinda,
+                      fontSize: 17,
+                      fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _tarjetaContactos() {
+    return Card(
+      elevation: 0,
+      color: Colors.white,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: BorderSide(color: Colors.grey.shade300),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Contactos de emergencia',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _phoneController,
+                    keyboardType: TextInputType.phone,
+                    decoration: const InputDecoration(
+                      hintText: 'Ej. +528711234567',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: kGuinda,
+                    minimumSize: const Size(0, 44),
+                  ),
+                  onPressed: _agregarReceptor,
+                  child: const Text('Agregar',
+                      style: TextStyle(color: Colors.white)),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 6,
+              children: _receptores
+                  .map((n) => Chip(
+                        label: Text(n),
+                        backgroundColor: Colors.red[50],
+                        deleteIcon: const Icon(Icons.close, size: 16),
+                        onDeleted: () => _quitarReceptor(n),
+                      ))
+                  .toList(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _seccionBanda() {
+    if (_nombreBanda.isNotEmpty) {
+      return Card(
+        color: Colors.red[50],
+        child: ListTile(
+          leading: const Icon(Icons.bluetooth, color: kGuinda, size: 32),
+          title: Text('Banda vinculada: $_nombreBanda'),
+          subtitle: Text(_conectado ? 'Conectada' : 'Buscando...'),
+          trailing: TextButton(
+            onPressed: _desvincular,
+            child: const Text('Desvincular'),
+          ),
+        ),
+      );
+    }
+
+    return Column(
+      children: [
+        ElevatedButton.icon(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: kGuinda,
+            minimumSize: const Size.fromHeight(50),
+          ),
+          onPressed: (_escaneando || !_servicioActivo) ? null : _escanear,
+          icon: const Icon(Icons.search, color: Colors.white),
+          label: Text(_escaneando ? 'Buscando banda...' : 'Buscar banda',
+              style: const TextStyle(color: Colors.white)),
+        ),
+        const SizedBox(height: 8),
+        for (final d in _dispositivos)
+          Card(
+            child: ListTile(
+              title: Text(d['nombre'] ?? ''),
+              subtitle: Text(d['id'] ?? ''),
+              trailing: ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: kGuinda),
+                onPressed: () => _vincular(d),
+                child: const Text('Conectar',
+                    style: TextStyle(color: Colors.white)),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+// =================================================================
+// 3. MODO RECEPTOR (sin cambios)
+// =================================================================
+class ReceptorScreen extends StatefulWidget {
+  const ReceptorScreen({super.key});
+
+  @override
+  State<ReceptorScreen> createState() => _ReceptorScreenState();
+}
+
+class _ReceptorScreenState extends State<ReceptorScreen> {
+  final TextEditingController _emisorController = TextEditingController();
+  String? emisorAsociado;
+  final List<String> _historialAlertas = [];
+
+  @override
+  void dispose() {
+    _emisorController.dispose();
+    super.dispose();
+  }
+
+  void _guardarEmisor() {
+    if (_emisorController.text.isNotEmpty) {
+      setState(() {
+        emisorAsociado = _emisorController.text;
+        _emisorController.clear();
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Emisor enlazado correctamente al receptor.'),
+            backgroundColor: Colors.green),
+      );
+    }
+  }
+
+  Future<void> _simularRecepcionAlerta() async {
+    String alertaTexto =
+        "¡Alerta de emergencia recibida del emisor $emisorAsociado!";
+
+    setState(() {
+      _historialAlertas.insert(0, alertaTexto);
+    });
+
+    const AndroidNotificationDetails androidDetalles =
+        AndroidNotificationDetails(
+      'canal_emergencia_sos',
+      'Alertas SOS',
+      channelDescription: 'Canal para notificaciones de emergencia',
+      importance: Importance.max,
+      priority: Priority.high,
+      ticker: 'ticker',
+      color: kGuinda,
+    );
+
+    await flutterLocalNotificationsPlugin.show(
+      0,
+      '🚨 ¡EMERGENCIA SOS!',
+      'Pulsa para ver la ubicación del emisor.',
+      const NotificationDetails(android: androidDetalles),
+      payload: 'item x',
+    );
+
+    if (mounted) {
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('¡Alerta Recibida!',
+              style: TextStyle(color: kGuinda, fontWeight: FontWeight.bold)),
+          content: Text(alertaTexto),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cerrar', style: TextStyle(color: kGuinda)),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Modo Receptor (Apoyo)',
+            style: TextStyle(color: Colors.white)),
+        backgroundColor: kGuinda,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          onPressed: () => Navigator.pushReplacement(context,
+              MaterialPageRoute(builder: (_) => const RoleSelectionScreen())),
+        ),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Configurar Emisor de Confianza',
+                style: TextStyle(
+                    fontSize: 18, fontWeight: FontWeight.bold, color: kGuinda)),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _emisorController,
+                    keyboardType: TextInputType.phone,
+                    decoration: const InputDecoration(
+                      hintText: 'Número de teléfono del Emisor',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(backgroundColor: kGuinda),
+                  onPressed: _guardarEmisor,
+                  child: const Text('Vincular',
+                      style: TextStyle(color: Colors.white)),
+                ),
+              ],
+            ),
+            const SizedBox(height: 15),
+            if (emisorAsociado != null) ...[
+              Card(
+                color: Colors.red[50],
+                child: ListTile(
+                  leading:
+                      const Icon(Icons.person_pin, color: kGuinda, size: 32),
+                  title: Text('Monitoreando al Emisor: $emisorAsociado'),
+                  subtitle:
+                      const Text('Escuchando notificaciones de emergencia...'),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.delete, color: Colors.red),
+                    onPressed: () => setState(() => emisorAsociado = null),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.orange[800],
+                  minimumSize: const Size.fromHeight(45),
+                ),
+                onPressed: _simularRecepcionAlerta,
+                icon: const Icon(Icons.notification_important,
+                    color: Colors.white),
+                label: const Text('SIMULAR ENTRADA DE ALERTA',
+                    style: TextStyle(color: Colors.white)),
+              ),
+            ],
+            const Divider(height: 30),
+            const Text('Bandeja de Alertas Recibidas',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
+            Expanded(
+              child: _historialAlertas.isEmpty
+                  ? const Center(
+                      child: Text(
+                        'No hay alertas de emergencia activas.\nLas notificaciones aparecerán aquí.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.grey),
+                      ),
+                    )
+                  : ListView.builder(
+                      itemCount: _historialAlertas.length,
+                      itemBuilder: (context, index) {
+                        return Card(
+                          color: Colors.red[50],
+                          child: ListTile(
+                            leading: const Icon(Icons.warning_amber_rounded,
+                                color: kGuinda),
+                            title: Text(_historialAlertas[index],
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.bold)),
+                            subtitle:
+                                const Text('Recibido vía SMS / Red de Alerta'),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

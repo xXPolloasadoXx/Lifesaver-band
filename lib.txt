@@ -1,0 +1,359 @@
+import 'dart:async';
+import 'dart:ui';
+import 'package:another_telephony/telephony.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+// ---------------------------------------------------------------
+// Constantes compartidas entre la app y el servicio
+// ---------------------------------------------------------------
+const String kUuidServicio = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const String kUuidCaracteristica = 'beb5483e-36e1-4888-b755-21d1b390d9f3';
+const String kCanalServicio = 'alerta_ble_bg_channel';
+
+// Tiempo mínimo entre dos alertas reales (evita SMS repetidos si la banda manda 'A' varias veces)
+const Duration kEnfriamientoAlerta = Duration(seconds: 60);
+
+// Claves de SharedPreferences
+const String kPrefReceptores = 'receptores';
+const String kPrefBandaId = 'banda_id';
+const String kPrefBandaNombre = 'banda_nombre';
+const String kPrefUltimaAlerta = 'ultima_alerta';
+
+// ---------------------------------------------------------------
+// Configuración del servicio (se llama una vez desde main)
+// ---------------------------------------------------------------
+Future<void> inicializarServicioSegundoPlano(
+    FlutterLocalNotificationsPlugin plugin) async {
+  const canal = AndroidNotificationChannel(
+    kCanalServicio,
+    'Servicio Alerta SOS',
+    description: 'Mantiene la conexión con la banda activa',
+    importance: Importance.low,
+  );
+
+  await plugin
+      .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(canal);
+
+  await FlutterBackgroundService().configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: alIniciarServicio,
+      autoStart: false,
+      isForegroundMode: true,
+      notificationChannelId: kCanalServicio,
+      initialNotificationTitle: 'Alerta SOS activa',
+      initialNotificationContent: 'Iniciando...',
+      foregroundServiceNotificationId: 888,
+      // Punto 3: Android 14 exige declarar el tipo del servicio
+      foregroundServiceTypes: [
+        AndroidForegroundType.location,
+        AndroidForegroundType.connectedDevice,
+      ],
+    ),
+    iosConfiguration: IosConfiguration(
+      autoStart: false,
+      onForeground: alIniciarServicio,
+      onBackground: alIosSegundoPlano,
+    ),
+  );
+}
+
+@pragma('vm:entry-point')
+bool alIosSegundoPlano(ServiceInstance service) {
+  WidgetsFlutterBinding.ensureInitialized();
+  return true;
+}
+
+@pragma('vm:entry-point')
+Future<void> alIniciarServicio(ServiceInstance service) async {
+  DartPluginRegistrant.ensureInitialized();
+  final motor = _MotorAlerta(service);
+  await motor.iniciar();
+}
+
+// ---------------------------------------------------------------
+// Motor: vive dentro del servicio y es el ÚNICO dueño del BLE
+// ---------------------------------------------------------------
+class _MotorAlerta {
+  _MotorAlerta(this.service);
+
+  final ServiceInstance service;
+  final Telephony _telephony = Telephony.instance;
+
+  bool _activo = true;
+  bool _conectado = false;
+  String _mensajeEstado = 'Iniciando...';
+
+  BluetoothDevice? _dispositivo;
+  String? _idActual;
+  StreamSubscription<BluetoothConnectionState>? _subConexion;
+  DateTime? _ultimaAlerta;
+  Completer<void>? _pausa;
+
+  Future<SharedPreferences> _prefs() async {
+    final p = await SharedPreferences.getInstance();
+    await p.reload(); // Lee lo que guardó la app (otro isolate)
+    return p;
+  }
+
+  Future<void> iniciar() async {
+    service.on('stopService').listen((_) => _detener());
+    service.on('pedirEstado').listen((_) => _emitirEstado());
+    service.on('escanear').listen((_) => _escanear());
+    service.on('alertaPrueba').listen((_) => _enviarAlerta(prueba: true));
+
+    service.on('conectar').listen((datos) async {
+      final id = datos?['id'] as String?;
+      final nombre = (datos?['nombre'] as String?) ?? '';
+      if (id == null) return;
+      final prefs = await _prefs();
+      await prefs.setString(kPrefBandaId, id);
+      await prefs.setString(kPrefBandaNombre, nombre);
+      _despertar();
+    });
+
+    service.on('desconectar').listen((_) async {
+      final prefs = await _prefs();
+      await prefs.remove(kPrefBandaId);
+      await prefs.remove(kPrefBandaNombre);
+      _despertar();
+    });
+
+    _emitirEstado();
+    await _bucleConexion();
+  }
+
+  // ---------------- Conexión y reconexión automática ----------------
+  Future<void> _bucleConexion() async {
+    while (_activo) {
+      try {
+        final prefs = await _prefs();
+        final id = prefs.getString(kPrefBandaId);
+
+        if (id == null) {
+          await _soltarDispositivo();
+          _actualizarEstado(false, 'Sin banda vinculada');
+        } else if (FlutterBluePlus.adapterStateNow != BluetoothAdapterState.on) {
+          _actualizarEstado(false, 'Bluetooth apagado');
+        } else {
+          if (_idActual != id) {
+            await _soltarDispositivo();
+            _idActual = id;
+            _dispositivo = BluetoothDevice.fromId(id);
+            _subConexion = _dispositivo!.connectionState.listen((estado) {
+              if (estado == BluetoothConnectionState.disconnected && _conectado) {
+                _actualizarEstado(false, 'Banda desconectada, reconectando...');
+                _despertar();
+              }
+            });
+          }
+
+          final d = _dispositivo!;
+          if (!d.isConnected) {
+            _actualizarEstado(false, 'Buscando banda...');
+            await d.connect(timeout: const Duration(seconds: 15));
+            try {
+              await _suscribir(d);
+            } catch (e) {
+              await d.disconnect();
+              rethrow;
+            }
+            _actualizarEstado(true, 'Todo listo para protegerte');
+          }
+        }
+      } catch (e) {
+        _actualizarEstado(false, 'Reconectando con la banda...');
+      }
+      await _esperar(const Duration(seconds: 5));
+    }
+  }
+
+  Future<void> _suscribir(BluetoothDevice d) async {
+    final servicios = await d.discoverServices();
+    for (final s in servicios) {
+      if (s.uuid.toString().toLowerCase() != kUuidServicio) continue;
+      for (final c in s.characteristics) {
+        if (c.uuid.toString().toLowerCase() != kUuidCaracteristica) continue;
+        await c.setNotifyValue(true);
+        // onValueReceived solo emite notificaciones nuevas (no valores viejos)
+        final sub = c.onValueReceived.listen(_alRecibir);
+        d.cancelWhenDisconnected(sub);
+        return;
+      }
+    }
+    throw Exception('No se encontró la característica de la banda');
+  }
+
+  void _alRecibir(List<int> valor) {
+    if (valor.contains(0x41)) {
+      _enviarAlerta();
+    }
+  }
+
+  Future<void> _soltarDispositivo() async {
+    await _subConexion?.cancel();
+    _subConexion = null;
+    final d = _dispositivo;
+    _dispositivo = null;
+    _idActual = null;
+    if (d != null) {
+      try {
+        await d.disconnect();
+      } catch (_) {}
+    }
+  }
+
+  // ---------------- Escaneo (lo hace el servicio, no la pantalla) ----------------
+  Future<void> _escanear() async {
+    final encontrados = <String, String>{};
+    StreamSubscription<List<ScanResult>>? sub;
+    try {
+      sub = FlutterBluePlus.scanResults.listen((lista) {
+        for (final r in lista) {
+          final nombre = r.device.platformName;
+          if (nombre.isNotEmpty) encontrados[r.device.remoteId.str] = nombre;
+        }
+      });
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 6));
+      await FlutterBluePlus.isScanning.where((e) => e == false).first;
+    } catch (_) {
+      // Si falla, se devuelve la lista como esté
+    } finally {
+      await sub?.cancel();
+    }
+    service.invoke('resultadosEscaneo', {
+      'dispositivos': encontrados.entries
+          .map((e) => {'id': e.key, 'nombre': e.value})
+          .toList(),
+    });
+  }
+
+  // ---------------- Alerta: ubicación + SMS (una sola vez) ----------------
+  Future<void> _enviarAlerta({bool prueba = false}) async {
+    final ahora = DateTime.now();
+    if (!prueba &&
+        _ultimaAlerta != null &&
+        ahora.difference(_ultimaAlerta!) < kEnfriamientoAlerta) {
+      return;
+    }
+    if (!prueba) _ultimaAlerta = ahora;
+
+    final prefs = await _prefs();
+    final receptores = prefs.getStringList(kPrefReceptores) ?? [];
+    if (receptores.isEmpty) {
+      _ultimaAlerta = null;
+      service.invoke('error', {'mensaje': 'No hay contactos guardados.'});
+      return;
+    }
+    if (!await Permission.sms.isGranted) {
+      _ultimaAlerta = null;
+      service.invoke('error', {'mensaje': 'Falta el permiso de SMS.'});
+      return;
+    }
+
+    final enlace = await _obtenerEnlaceUbicacion();
+    final ubicacion =
+        enlace != null ? 'Mi ubicación: $enlace' : 'No pude obtener mi ubicación.';
+    final mensaje = prueba
+        ? 'PRUEBA de Banda Alerta (no es una emergencia). $ubicacion'
+        : '¡EMERGENCIA! Necesito ayuda urgente. $ubicacion';
+
+    int enviados = 0;
+    for (final numero in receptores) {
+      try {
+        await _telephony.sendSms(to: numero, message: mensaje, isMultipart: true);
+        enviados++;
+      } catch (_) {}
+    }
+
+    if (enviados == 0) {
+      _ultimaAlerta = null; // Permite reintentar
+      service.invoke('error', {'mensaje': 'No se pudo enviar el SMS.'});
+      return;
+    }
+
+    final texto =
+        '${prueba ? 'Prueba' : 'Alerta'} enviada a $enviados contacto(s) · ${_horaActual()}';
+    await prefs.setString(kPrefUltimaAlerta, texto);
+    service.invoke('alertaEnviada', {'texto': texto, 'prueba': prueba});
+    _actualizarNotificacion(content: texto);
+  }
+
+  // Si no hay GPS a tiempo, usa la última ubicación; si tampoco, manda el SMS sin enlace
+  Future<String?> _obtenerEnlaceUbicacion() async {
+    Position? pos;
+    try {
+      if (await Geolocator.isLocationServiceEnabled()) {
+        pos = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high,
+          timeLimit: const Duration(seconds: 20),
+        );
+      }
+    } catch (_) {}
+    if (pos == null) {
+      try {
+        pos = await Geolocator.getLastKnownPosition();
+      } catch (_) {}
+    }
+    if (pos == null) return null;
+    return 'https://maps.google.com/?q=${pos.latitude.toStringAsFixed(7)},${pos.longitude.toStringAsFixed(7)}';
+  }
+
+  String _horaActual() {
+    final n = DateTime.now();
+    final h = n.hour % 12 == 0 ? 12 : n.hour % 12;
+    final m = n.minute.toString().padLeft(2, '0');
+    return '$h:$m ${n.hour >= 12 ? 'pm' : 'am'}';
+  }
+
+  // ---------------- Estado y notificación ----------------
+  void _actualizarEstado(bool conectado, String mensaje) {
+    if (_conectado == conectado && _mensajeEstado == mensaje) return;
+    _conectado = conectado;
+    _mensajeEstado = mensaje;
+    _actualizarNotificacion(content: mensaje);
+    _emitirEstado();
+  }
+
+  void _actualizarNotificacion({required String content}) {
+    final s = service;
+    if (s is AndroidServiceInstance) {
+      s.setForegroundNotificationInfo(
+        title: _conectado ? 'Banda activa y protegiéndote' : 'Alerta SOS activa',
+        content: content,
+      );
+    }
+  }
+
+  void _emitirEstado() {
+    service.invoke('estado', {
+      'conectado': _conectado,
+      'mensaje': _mensajeEstado,
+    });
+  }
+
+  // ---------------- Utilidades ----------------
+  Future<void> _esperar(Duration d) async {
+    _pausa = Completer<void>();
+    await Future.any([Future.delayed(d), _pausa!.future]);
+  }
+
+  void _despertar() {
+    final p = _pausa;
+    if (p != null && !p.isCompleted) p.complete();
+  }
+
+  Future<void> _detener() async {
+    _activo = false;
+    _despertar();
+    await _soltarDispositivo();
+    service.stopSelf();
+  }
+}
